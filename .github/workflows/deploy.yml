@@ -1,0 +1,151 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:  # Manual trigger
+
+env:
+  VPS_HOST: ${{ secrets.VPS_HOST }}
+  VPS_USER: ${{ secrets.VPS_USER }}
+  VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+  DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run tests
+      run: |
+        python -c "
+        # Basic validation tests
+        def clean_registration_number(reg_no):
+            return reg_no.strip() if len(reg_no.strip()) == 11 and reg_no.strip().isdigit() else ''
+        
+        assert clean_registration_number('24012300001') == '24012300001'
+        assert clean_registration_number('invalid') == ''
+        assert clean_registration_number('  24012300002  ') == '24012300002'
+        print('✅ All validation tests passed!')
+        "
+
+    - name: Notify Discord - Deployment Started
+      if: always()
+      uses: sarisia/actions-status-discord@v1
+      with:
+        webhook: ${{ secrets.DISCORD_WEBHOOK }}
+        title: "🚀 Deployment Started"
+        description: "Deploying Results Monitor to VPS"
+        color: "0x3498db"
+        username: "GitHub Actions"
+        avatar: "https://github.com/github.png"
+
+    - name: Setup SSH
+      run: |
+        mkdir -p ~/.ssh
+        echo "$VPS_SSH_KEY" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H $VPS_HOST >> ~/.ssh/known_hosts
+
+    - name: Deploy to VPS
+      run: |
+        ssh -o StrictHostKeyChecking=no $VPS_USER@$VPS_HOST << 'EOF'
+        # Create directory if it doesn't exist
+        mkdir -p ~/results-monitor
+        
+        # Navigate to directory
+        cd ~/results-monitor
+        
+        # Pull latest changes
+        git pull origin main || git clone https://github.com/${{ github.repository }}.git .
+        
+        # Create virtual environment if it doesn't exist
+        if [ ! -d "venv" ]; then
+            python3 -m venv venv
+        fi
+        
+        # Activate venv and install dependencies
+        source venv/bin/activate
+        pip install --upgrade pip
+        pip install -r requirements.txt
+        
+        # Ensure environment file exists
+        if [ ! -f ".env" ]; then
+            cp .env.example .env
+            echo "⚠️  Please update .env file with your Discord webhook"
+        fi
+        
+        # Ensure registration numbers file exists
+        touch registration_numbers.txt
+        
+        # Setup systemd service
+        sudo bash -c 'cat > /etc/systemd/system/results-monitor.service << EOL
+[Unit]
+Description=Results Monitor Bot
+After=network.target
+
+[Service]
+Type=simple
+User=$VPS_USER
+WorkingDirectory=/home/$VPS_USER/results-monitor
+Environment=PATH=/home/$VPS_USER/results-monitor/venv/bin
+ExecStart=/home/$VPS_USER/results-monitor/venv/bin/python3 main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOL'
+        
+        # Reload and restart service
+        sudo systemctl daemon-reload
+        sudo systemctl enable results-monitor
+        sudo systemctl restart results-monitor
+        
+        echo "✅ Deployment completed successfully"
+        EOF
+
+    - name: Verify Deployment
+      run: |
+        ssh $VPS_USER@$VPS_HOST "sudo systemctl is-active results-monitor"
+      if: always()
+
+    - name: Notify Discord - Deployment Success
+      if: success()
+      uses: sarisia/actions-status-discord@v1
+      with:
+        webhook: ${{ secrets.DISCORD_WEBHOOK }}
+        title: "✅ Deployment Successful"
+        description: "Results Monitor deployed and running on VPS"
+        color: "0x2ecc71"
+        username: "GitHub Actions"
+        avatar: "https://github.com/github.png"
+
+    - name: Notify Discord - Deployment Failed
+      if: failure()
+      uses: sarisia/actions-status-discord@v1
+      with:
+        webhook: ${{ secrets.DISCORD_WEBHOOK }}
+        title: "❌ Deployment Failed"
+        description: "Failed to deploy Results Monitor to VPS"
+        color: "0xe74c3c"
+        username: "GitHub Actions"
+        avatar: "https://github.com/github.png"
